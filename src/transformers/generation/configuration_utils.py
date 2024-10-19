@@ -82,6 +82,7 @@ class GenerationMode(ExplicitEnum):
     CONTRASTIVE_SEARCH = "contrastive_search"
     GREEDY_SEARCH = "greedy_search"
     SAMPLE = "sample"
+    ARITHMETIC = "arithmetic"
     ASSISTED_GENERATION = "assisted_generation"
     DOLA_GENERATION = "dola_generation"
     # Beam methods
