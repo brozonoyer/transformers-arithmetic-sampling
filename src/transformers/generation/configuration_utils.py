@@ -82,7 +82,7 @@ class GenerationMode(ExplicitEnum):
     CONTRASTIVE_SEARCH = "contrastive_search"
     GREEDY_SEARCH = "greedy_search"
     SAMPLE = "sample"
-    ARITHMETIC = "arithmetic"
+    ARITHMETIC_SAMPLING = "arithmetic_sampling"
     ASSISTED_GENERATION = "assisted_generation"
     DOLA_GENERATION = "dola_generation"
     # Beam methods
@@ -387,6 +387,7 @@ class GenerationConfig(PushToHubMixin):
         self.num_beam_groups = kwargs.pop("num_beam_groups", 1)
         self.penalty_alpha = kwargs.pop("penalty_alpha", None)
         self.dola_layers = kwargs.pop("dola_layers", None)
+        self.do_arithmetic_sampling = kwargs.pop("do_arithmetic_sampling", False)
 
         # Parameters that control the cache
         self.use_cache = kwargs.pop("use_cache", True)
@@ -428,6 +429,7 @@ class GenerationConfig(PushToHubMixin):
         self.token_healing = kwargs.pop("token_healing", False)
         self.guidance_scale = kwargs.pop("guidance_scale", None)
         self.low_memory = kwargs.pop("low_memory", None)
+        self.arithmetic_sampling_codes_seed = kwargs.pop("arithmetic_sampling_codes_seed", 0)
         watermarking_config = kwargs.pop("watermarking_config", None)
         if watermarking_config is None:
             self.watermarking_config = None
@@ -556,6 +558,11 @@ class GenerationConfig(PushToHubMixin):
                     "You've set `dola_layers`, which triggers DoLa generate. Currently, DoLa generate "
                     "is only supported with Greedy Search and Sample."
                 )
+
+        # arithmetic sampling requires a seed for generating code points
+        if self.do_arithmetic_sampling:
+            generation_mode = GenerationMode.ARITHMETIC_SAMPLING
+
         return generation_mode
 
     def validate(self, is_init=False):
@@ -721,17 +728,18 @@ class GenerationConfig(PushToHubMixin):
 
         # 4. check `num_return_sequences`
         if self.num_return_sequences != 1:
-            if self.num_beams == 1:
-                if self.do_sample is False:
+            if not self.do_arithmetic_sampling:
+                if self.num_beams == 1:
+                    if self.do_sample is False:
+                        raise ValueError(
+                            "Greedy methods without beam search do not support `num_return_sequences` different than 1 "
+                            f"(got {self.num_return_sequences})."
+                        )
+                elif self.num_return_sequences > self.num_beams:
                     raise ValueError(
-                        "Greedy methods without beam search do not support `num_return_sequences` different than 1 "
-                        f"(got {self.num_return_sequences})."
+                        f"`num_return_sequences` ({self.num_return_sequences}) has to be smaller or equal to `num_beams` "
+                        f"({self.num_beams})."
                     )
-            elif self.num_return_sequences > self.num_beams:
-                raise ValueError(
-                    f"`num_return_sequences` ({self.num_return_sequences}) has to be smaller or equal to `num_beams` "
-                    f"({self.num_beams})."
-                )
 
         # 5. check cache-related arguments
         if self.cache_implementation is not None and self.cache_implementation not in ALL_CACHE_IMPLEMENTATIONS:

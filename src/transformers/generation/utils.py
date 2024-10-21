@@ -2227,7 +2227,7 @@ class GenerationMixin:
                 **model_kwargs,
             )
 
-        elif generation_mode == GenerationMode.ARITHMETIC:
+        elif generation_mode == GenerationMode.ARITHMETIC_SAMPLING:
             # 11. expand input_ids with `num_return_sequences` additional sequences per batch
             input_ids, model_kwargs = self._expand_inputs_for_generation(
                 input_ids=input_ids,
@@ -2236,12 +2236,20 @@ class GenerationMixin:
                 **model_kwargs,
             )
 
-            # 12. run sample
+            # 12. generate code points for arithmetic sampling
+            codes = torch.flatten(
+                _arithmetic_sampling_make_default_codes(
+                    batch_size,
+                    generation_config.num_return_sequences,
+                    generation_config.arithmetic_sampling_codes_seed))
+
+            # 13. run sample
             result = self._arithmetic_sample(
                 input_ids,
+                codes=codes,
                 logits_processor=prepared_logits_processor,
                 stopping_criteria=prepared_stopping_criteria,
-                seed=generation_config.arithmetic_seed,
+                generation_config=generation_config,
                 synced_gpus=synced_gpus,
                 streamer=streamer,
                 **model_kwargs,
@@ -3323,6 +3331,7 @@ class GenerationMixin:
     def _arithmetic_sample(
         self,
         input_ids: torch.LongTensor,
+        codes: torch.Tensor,
         logits_processor: LogitsProcessorList,
         stopping_criteria: StoppingCriteriaList,
         generation_config: GenerationConfig,
@@ -3371,7 +3380,6 @@ class GenerationMixin:
         return_dict_in_generate = generation_config.return_dict_in_generate
         max_length = generation_config.max_length
         has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
-        do_sample = generation_config.do_sample
 
         # init attention / hidden states / scores tuples
         scores = () if (return_dict_in_generate and output_scores) else None
@@ -3392,10 +3400,6 @@ class GenerationMixin:
         this_peer_finished = False
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
         model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
-
-        # TODO start AS logic
-        
-        # TODO generate codes
 
         while self._has_unfinished_sequences(
             this_peer_finished, synced_gpus, device=input_ids.device, cur_len=cur_len, max_length=max_length
@@ -3447,13 +3451,66 @@ class GenerationMixin:
                         else (outputs.hidden_states,)
                     )
 
-            # token selection
-            if do_sample:
-                probs = nn.functional.softmax(next_token_scores, dim=-1)
-                # TODO (joao): this OP throws "skipping cudagraphs due to ['incompatible ops']", find solution
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-            else:
-                next_tokens = torch.argmax(next_token_scores, dim=-1)
+            #########################################################################################################
+
+            # We randomly permute the logits here at each timestep to avoid depending on
+            # the default order of the vocabulary. This isn't strictly necessary.
+            # We need to invert this permutation at the end cause it changes the
+            # identities of the sampled indices.
+            _, vocab_size = next_token_scores.shape
+            perm = torch.randperm(vocab_size).to(input_ids.device)
+            invperm = torch.argsort(perm)
+
+            next_token_scores = next_token_scores[:, perm]
+            
+            # Now we want to, for each element in the batch, get the normalized
+            # probabilities, stack them in the unit interval into buckets, and figure
+            # out what bucket the code falls into.
+            probs = nn.functional.softmax(next_token_scores, dim=-1)
+            
+            # nondecreasing array of partial sums
+            cumprobs = torch.cumsum(probs, dim=-1)
+
+            # Because of precision, make sure the max value (and everything with that
+            # value, to not change bucket widths) is at least 1.0.
+            max_probs = cumprobs.max(dim=-1, keepdim=True)[0].expand_as(cumprobs)
+            all_bucket_maxes = torch.where((cumprobs == max_probs) & (cumprobs < 1.0), 1.0, cumprobs).to(input_ids.device)
+
+            # Now the cumulative probabilities represent the max value of each of the
+            # buckets. So let's make a mask of all the buckets whose maxes are less
+            # than and greater than the given codes.
+            expanded_codes = codes.unsqueeze(1).to(input_ids.device)
+            bucket_maxes_lte_codes = all_bucket_maxes <= expanded_codes
+            bucket_maxes_gt_codes = all_bucket_maxes > expanded_codes
+
+            # Pick the minimum value for the bucket for the code. Note this will be
+            # 0.0 if the code falls into the zero'th bucket, as desired.
+            code_bucket_mins = (all_bucket_maxes * bucket_maxes_lte_codes).max(dim=-1)[0]
+
+            # We have to do some masking here, and for probabilities, anything > 1.0
+            # is as good as infinity.
+            prob_infty = 1.1
+            # Pick the maximum value for the bucket, the first bucket whose max is
+            # greater than the code.
+            code_bucket_maxes = (all_bucket_maxes * bucket_maxes_gt_codes + \
+                                 bucket_maxes_lte_codes * prob_infty).min(dim=-1)[0]
+
+            # We have to take the argmin before inverting the permutation,
+            # otherwise it messes up the default tie breaking behavior for size zero
+            # buckets (take lowest index).
+            sampled_indices_permed = (all_bucket_maxes * bucket_maxes_gt_codes + \
+                                      bucket_maxes_lte_codes * prob_infty).argmin(dim=-1)
+
+            next_tokens = torch.argmax(torch.nn.functional.one_hot(sampled_indices_permed, num_classes=vocab_size)[:, invperm], dim=-1)
+
+            codes = codes.to(input_ids.device)
+            code_bucket_mins = code_bucket_mins.to(input_ids.device)
+            code_bucket_maxes = code_bucket_maxes.to(input_ids.device)
+
+            # Compute new codes for remaining suffix.
+            codes = ((codes - code_bucket_mins) / (code_bucket_maxes - code_bucket_mins)).to(input_ids.device)
+            
+            #########################################################################################################
 
             # finished sentences should have their next token be a padding token
             if has_eos_stopping_criteria:
@@ -3471,8 +3528,6 @@ class GenerationMixin:
             # This is needed to properly delete outputs.logits which may be very large for first iteration
             # Otherwise a reference to outputs is kept which keeps the logits alive in the next iteration
             del outputs
-
-        # TODO end AS logic
 
         if streamer is not None:
             streamer.end()
@@ -4945,3 +5000,19 @@ def _dola_select_contrast(
     final_logits, base_logits = _relative_top_filter(final_logits, base_logits)
     logits = final_logits - base_logits
     return logits
+
+
+def _arithmetic_sampling_make_default_codes(batch_size, num_decodes, seed):
+
+    # Generate random offset
+    torch.manual_seed(seed)
+    offset = torch.rand(batch_size, 1)
+
+    # Generate evenly spaced codes
+    codes = torch.arange(1, num_decodes + 1, dtype=torch.float32) / (num_decodes + 1)
+    codes = codes.unsqueeze(0).repeat(batch_size, 1)
+
+    # Tile the offset and add it to the codes
+    codes = (codes + offset) % 1.0
+
+    return codes
